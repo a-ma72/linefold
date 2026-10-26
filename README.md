@@ -8,6 +8,8 @@ linefold draws a long line by folding it into one column per pixel. Each column 
 
 Python 3.11 or newer is required.
 
+[plotcore](https://github.com/jonassattler/plotcore) continues this project in C++, which makes it portable, and offers it for Python and Rust as well. When more features are needed, that project is warmly recommended.
+
 ## Install
 
 ```bash
