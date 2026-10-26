@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/linefold-logo.png" alt="linefold" width="632">
+  <img src="https://raw.githubusercontent.com/a-ma72/linefold/main/docs/linefold-logo.png" alt="linefold" width="632">
 </p>
 
 # linefold
