@@ -1,0 +1,3 @@
+prune examples/samples
+prune .backup
+global-exclude *.npy *.rpc *.rsp *.tim *.drv *.png *.jpg *.jpeg *.webp *.so
