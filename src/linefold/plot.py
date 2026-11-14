@@ -6,7 +6,8 @@
 ``MplView`` and the RPC3 catalog call this. The picture is the column
 envelope from ``fold``: the extremes of a column, then the chord at each
 edge. A long line keeps that fold in a ladder, so a wide column does not
-walk its samples again. The value under the pointer stays put, a quarter of
+walk its samples again, and a pan by whole columns keeps the columns it
+already folded. The value under the pointer stays put, a quarter of
 the window stays over the data, and a logarithmic base only numbers the powers.
 """
 
@@ -16,7 +17,9 @@ import math
 
 import numpy as np
 
-from .fold import BASE, ColumnCache, _chord_time, envelope, limits, monotonic, y_on_chord
+from .fold import (
+    BASE, ColumnCache, ColumnScratch, _chord_time, envelope, limits, monotonic, y_on_chord,
+)
 
 # The cycle used when a line brings no colour of its own.
 CYCLE = (
@@ -37,15 +40,18 @@ _MINIMUM_BAND = 12.0
 
 
 class _Run:
-    __slots__ = ("first", "count", "red", "green", "blue", "alpha", "width", "summarised")
+    __slots__ = (
+        "first", "count", "red", "green", "blue", "alpha", "width", "summarised", "markers",
+    )
 
-    def __init__(self, first, count, colour, summarised):
+    def __init__(self, first, count, colour, summarised, *, markers=False):
         self.first = int(first)
         self.count = int(count)
         self.red, self.green, self.blue = (int(channel) for channel in colour)
         self.alpha = 255
         self.width = 1.0
         self.summarised = bool(summarised)
+        self.markers = bool(markers)
 
 
 class _Sample:
@@ -83,9 +89,10 @@ class _Tick:
 
 class _Line:
     __slots__ = (
-        "y", "x", "explicit_x", "monotonic_x", "colour", "name", "own", "scale_y", "shift_y",
-        "y_log", "y_span", "y_low", "y_high", "y_pos", "x_low", "x_high", "x_pos",
-        "_cache", "_cached_y",
+        "y", "x", "explicit_x", "monotonic_x", "colour", "name", "own", "markers",
+        "scale_y", "shift_y", "y_log", "y_span", "y_low", "y_high", "y_pos",
+        "x_low", "x_high", "x_pos",
+        "_cache", "_cached_y", "_scratch",
     )
 
     def __init__(self, y, colour, name):
@@ -96,6 +103,7 @@ class _Line:
         self.colour = colour
         self.name = name
         self.own = False
+        self.markers = False
         self.scale_y = 1.0
         self.shift_y = 0.0
         self.y_log = False
@@ -106,6 +114,7 @@ class _Line:
         self.x_pos = 1.0 if y.size > 1 else None
         self._cache = None
         self._cached_y = None
+        self._scratch = ColumnScratch()
         self._read_y()
 
     def column_cache(self):
@@ -117,6 +126,7 @@ class _Line:
         if self._cached_y is not self.y:
             self._cached_y = self.y
             self._cache = ColumnCache(self.y) if int(self.y.size) >= BASE else None
+            self._scratch.drop()
         return self._cache
 
     def _read_y(self):
@@ -130,6 +140,7 @@ class _Line:
 
     def set_x(self, x):
         """Index domain when ``x`` is None or does not run one way."""
+        self._scratch.drop()
         count = int(self.y.size)
         if x is None:
             self.x = None
@@ -620,6 +631,26 @@ def _chord_at(line, edge, log_x: bool, log_y: bool):
     return y_on_chord(line.y, float(edge), log_x, log_y)
 
 
+def _last_in_column(line, left, right, log_x, log_y):
+    """The last sample, when this column holds it and the right edge is past it.
+
+    A chord needs a sample on either side of the edge. The edge past the end
+    has none, and placing the last value there drew the line on to the frame.
+    The stroke stops on the sample. An edge before the first sample is left
+    as the gap it already is.
+    """
+    count = int(line.y.size)
+    if count < 1:
+        return None
+    y_last = float(line.y[-1])
+    x_last = float(line.x[-1]) if line.monotonic_x else float(count - 1)
+    if not (left <= x_last < right):
+        return None
+    if not _drawable_sample(x_last, y_last, log_x, log_y):
+        return None
+    return x_last, y_last
+
+
 def _append_gap(xs, ys, pxs, pys) -> None:
     xs.append(math.nan)
     ys.append(math.nan)
@@ -778,13 +809,19 @@ class Plot:
     def close(self) -> None:
         self.clear()
 
-    def add_line(self, y, colour=None, name=None) -> int:
+    def add_line(self, y, colour=None, name=None, *, markers=False) -> int:
+        """Append a line. ``markers`` draws each finite sample and no stroke.
+
+        A NaN between turning points is a gap. Folded as a line, that gap
+        becomes the chord, so a marked line never enters the envelope.
+        """
         if colour is None:
             colour = CYCLE[len(self._lines) % len(CYCLE)]
         colour = (int(colour[0]), int(colour[1]), int(colour[2]))
         text = str(name).strip() if name else ""
         array = np.ascontiguousarray(y, dtype=np.float64)
         line = _Line(array, colour, text or None)
+        line.markers = bool(markers)
         shared = self._shared_x
         if shared is not None:
             if shared.size < 2 or shared.size != line.y.size:
@@ -1175,6 +1212,11 @@ class Plot:
             if line.y.size < 2:
                 line.y_span = self._camera.y_span()
                 continue
+            if line.markers:
+                self._project_markers(
+                    xs, ys, pxs, pys, vertices, runs, owners, index, line, x0, x1, log_x,
+                )
+                continue
             log_y = self.line_y_log(index)
             time = line.x if line.monotonic_x else None
             # Anchored columns: panning slides the window across a fixed grid
@@ -1182,7 +1224,7 @@ class Plot:
             # its column, and the line translates instead of boiling.
             mins, maxs, counts, edges = envelope(
                 line.y, x0, x1, columns, x=time, log_x=log_x, log_y=log_y,
-                cache=line.column_cache(), anchored=True,
+                cache=line.column_cache(), anchored=True, scratch=line._scratch,
             )
             if edges.size != columns + 1:
                 line.y_span = self._camera.y_span()
@@ -1232,6 +1274,26 @@ class Plot:
                     y_left = _chord_at(line, edges[column], log_x, log_y)
                     y_right = _chord_at(line, edges[column + 1], log_x, log_y)
                     if y_left is None or y_right is None:
+                        ended = None
+                        if y_left is not None and y_right is None:
+                            ended = _last_in_column(
+                                line, float(edges[column]), float(edges[column + 1]), log_x, log_y,
+                            )
+                        if ended is not None:
+                            x_last, y_last = ended
+                            if not linked:
+                                self._push(
+                                    xs, ys, pxs, pys, vertices, index, float(edges[column]), y_left,
+                                    low, high, log_y, line.colour,
+                                )
+                            self._push(
+                                xs, ys, pxs, pys, vertices, index, x_last, y_last,
+                                low, high, log_y, line.colour,
+                            )
+                            segments.append((index, pxs[-2], pys[-2], pxs[-1], pys[-1]))
+                            _append_gap(xs, ys, pxs, pys)
+                            linked = False
+                            continue
                         if linked:
                             _append_gap(xs, ys, pxs, pys)
                             linked = False
@@ -1324,6 +1386,26 @@ class Plot:
         if top is None or bottom is None:
             return False
         return abs(top - bottom) * self._height >= 1.0
+
+    def _project_markers(
+        self, xs, ys, pxs, pys, vertices, runs, owners, index, line, x0, x1, log_x,
+    ) -> None:
+        """One vertex per finite sample in the window, and no segment between them."""
+        log_y = self.line_y_log(index)
+        low, high = self.line_y_range(index)
+        first = len(xs)
+        start, stop = _sample_window(line, x0, x1)
+        for i in range(start, stop):
+            x = float(line.x[i]) if line.monotonic_x else float(i)
+            y = float(line.y[i])
+            if x < x0 or x > x1 or not _drawable_sample(x, y, log_x, log_y):
+                continue
+            self._push(xs, ys, pxs, pys, vertices, index, x, y, low, high, log_y, line.colour)
+        count = len(xs) - first
+        if count > 0:
+            runs.append(_Run(first, count, line.colour, False, markers=True))
+            owners.append(index)
+        line.y_span = self._camera.y_span()
 
     def _stroke_samples(
         self, xs, ys, pxs, pys, vertices, segments, index, line, x0, x1, low, high, log_x, log_y,

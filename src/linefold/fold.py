@@ -13,11 +13,13 @@ Sample ``i`` of an index line sits at ``x = i``. A monotonic time base is the
 same split, read backwards: the edges are values, and the samples are the ones
 whose time falls between them.
 
-A line of at least ``BASE`` samples keeps a ladder of those folds. Each rung
-holds the first sample, the minimum, the maximum and the last sample of its
-buckets, and a wide column is answered from the rungs that tile it. The chord
-at a column edge is still the two raw samples beside that edge, so the picture
-is the one the scan draws.
+A line of at least ``BASE`` samples keeps a ladder of those folds. Rungs of
+``FINE`` samples and up answer a column from the coarsest bucket that tiles
+it, so a wide view does not walk every sample. From ``BASE`` up a bucket also
+keeps its first sample, its last sample and the positive-only fold a
+logarithmic y axis reads. The fine rungs below that keep only the minimum,
+the maximum and the count. The chord at a column edge is still the two raw
+samples beside that edge, so the picture is the one the scan draws.
 """
 
 from __future__ import annotations
@@ -238,14 +240,12 @@ def _edges(x0, x1, columns, log_x):
     return x0 + np.arange(columns + 1, dtype=np.float64) * ((x1 - x0) / columns)
 
 
-def _anchored_edges(x0, x1, columns, log_x):
-    """Column edges on a grid that stays put while the window is panned.
+def _grid(x0, x1, columns, log_x):
+    """``(width, origin, edges)`` of the anchored column grid, or None.
 
-    A column has the window's width, so the pane still gets one column a
-    device pixel. The grid is anchored at zero — at one, on a logarithmic
-    axis — and phased so each column holds the sample under that pixel's
-    centre. A grid locked to the window would slide every boundary by a
-    fraction of a sample as the pane moves, and the line would boil.
+    ``origin`` is the integer index of the first edge. A later window with
+    the same width and an origin an integer number of columns away is the
+    same grid, slid.
     """
     columns = int(columns)
     if columns < 1 or not (x1 > x0):
@@ -258,13 +258,30 @@ def _anchored_edges(x0, x1, columns, log_x):
         width = (p1 - p0) / columns
         if not width > 0.0:
             return None
-        k0 = math.floor(p0 / width + 0.5)
-        return np.exp((k0 + np.arange(columns + 1, dtype=np.float64)) * width)
+        origin = float(math.floor(p0 / width + 0.5))
+        edges = np.exp((origin + np.arange(columns + 1, dtype=np.float64)) * width)
+        return width, origin, edges
     width = (float(x1) - float(x0)) / columns
     if not width > 0.0:
         return None
-    k0 = math.floor(float(x0) / width + 0.5)
-    return (k0 + np.arange(columns + 1, dtype=np.float64)) * width
+    origin = float(math.floor(float(x0) / width + 0.5))
+    edges = (origin + np.arange(columns + 1, dtype=np.float64)) * width
+    return width, origin, edges
+
+
+def _anchored_edges(x0, x1, columns, log_x):
+    """Column edges on a grid that stays put while the window is panned.
+
+    A column has the window's width, so the pane still gets one column a
+    device pixel. The grid is anchored at zero — at one, on a logarithmic
+    axis — and phased so each column holds the sample under that pixel's
+    centre. A grid locked to the window would slide every boundary by a
+    fraction of a sample as the pane moves, and the line would boil.
+    """
+    grid = _grid(x0, x1, columns, log_x)
+    if grid is None:
+        return None
+    return grid[2]
 
 
 def _index_spans(edges, samples):
@@ -312,8 +329,16 @@ def _chord_time(x, data, edge, log_x, log_y):
     return value
 
 
-# A column narrower than this is cheaper to scan than to look up. The ladder
-# starts here: one bucket is this many samples, aligned to a multiple of it.
+# The finest bucket a column is answered from. Anything shorter is a handful
+# of samples, and it is cheaper to read them than to look a bucket up. The
+# rungs below ``BASE`` are this width doubled twice over, and they store only
+# the minimum, the maximum and the count.
+FINE = 4
+
+# One bucket of the stored ladder. The rungs from here up keep the positive
+# copy a logarithmic y reads, and the first and last sample of the bucket.
+# A column shorter than this used to be a raw scan; the fine rungs are what
+# answers it.
 BASE = 1024
 
 # How many buckets of one rung become one bucket of the next. The last entry
@@ -333,27 +358,32 @@ def _fan_at(pattern, step):
 
 
 def _rungs(n, pattern):
-    """``(nominal, starts, ends)`` from the coarsest rung down to the base.
+    """``(nominal, starts, ends)`` from the coarsest rung down to ``FINE``.
 
     ``nominal`` is the aligned width. The last bucket of a rung is shorter
     when the line does not fill it, and it still starts on the alignment.
+    Up to ``BASE`` the fan is four, so the fine rungs are 4, 16, 64 and 256.
+    Above ``BASE`` the fan is ``pattern``.
     """
     n = int(n)
     if n < BASE:
         return []
-    count = (n + BASE - 1) // BASE
-    starts = np.arange(count, dtype=np.int64) * BASE
-    ends = np.minimum(starts + BASE, n)
-    fine = [(BASE, starts, ends)]
+    count = (n + FINE - 1) // FINE
+    starts = np.arange(count, dtype=np.int64) * FINE
+    ends = np.minimum(starts + FINE, n)
+    built = [(FINE, starts, ends)]
+    while built[-1][0] < BASE:
+        child_nominal, child_starts, child_ends = built[-1]
+        first, last = _group_index(int(child_starts.size), 4)
+        built.append((child_nominal * 4, child_starts[first], child_ends[last]))
     step = 0
-    while fine[-1][1].size > 1:
+    while built[-1][1].size > 1:
         fan = _fan_at(pattern, step)
         step += 1
-        child_nominal, child_starts, child_ends = fine[-1]
-        nominal = child_nominal * fan
+        child_nominal, child_starts, child_ends = built[-1]
         first, last = _group_index(int(child_starts.size), fan)
-        fine.append((nominal, child_starts[first], child_ends[last]))
-    return list(reversed(fine))
+        built.append((child_nominal * fan, child_starts[first], child_ends[last]))
+    return list(reversed(built))
 
 
 def _rung_parts(rung):
@@ -374,7 +404,7 @@ def _advance(rungs, at, end):
     """The coarsest bucket that starts at ``at`` and ends by ``end``.
 
     None when no bucket starts here and still fits. The gap runs to the next
-    multiple of the base width, so the samples in it are one slice.
+    multiple of ``FINE``, so the samples in it are one slice.
     """
     for level, rung in enumerate(rungs):
         nominal, starts, ends = _rung_parts(rung)
@@ -399,7 +429,7 @@ def _bucket_reads(n, pattern, start, end):
     at = int(start)
     end = int(end)
     reads = 0
-    base = BASE
+    base = FINE
     while at < end:
         step = _advance(rungs, at, end)
         if step is None:
@@ -429,9 +459,9 @@ def schedule_cost(n=1 << 20):
     """Stored buckets, and buckets read over :func:`_probe_spans`, per schedule.
 
     Counts, not durations. The taper is the one to keep when it reads no more
-    than a factor of two and stores no more than a factor of four. The small
-    rungs dominate the store, so the extra large sizes the taper keeps are the
-    whole of the difference.
+    than the twos and stores no more than the fours. The fine rungs are in
+    that store, and they are the same four-wide ladder for every schedule, so
+    what still decides it is the rungs above ``BASE``.
     """
     patterns = {"four": FAN_FOUR, "two": FAN_TWO, "taper": FAN_TAPER}
     stored = {name: _bucket_count(n, pattern) for name, pattern in patterns.items()}
@@ -452,6 +482,41 @@ def chosen_pattern(n=1 << 20):
 
 
 PATTERN = chosen_pattern()
+
+
+class _SlimRung:
+    """One fine rung: minimum, maximum and count. No first, last or positive copy.
+
+    The rungs below ``BASE`` are most of the ladder's memory. A logarithmic y
+    does not read them: that axis still wants the positive copy, which the
+    rungs from ``BASE`` up keep.
+    """
+
+    __slots__ = ("nominal", "starts", "ends", "mins", "maxs", "counts")
+
+    def __init__(self, nominal, starts, ends):
+        self.nominal = int(nominal)
+        self.starts = np.asarray(starts, dtype=np.int64)
+        self.ends = np.asarray(ends, dtype=np.int64)
+        count = int(self.starts.size)
+        self.mins = np.full(count, np.nan, dtype=np.float64)
+        self.maxs = np.full(count, np.nan, dtype=np.float64)
+        self.counts = np.zeros(count, dtype=np.int64)
+
+
+def _merge_slim(child, fan):
+    """One bucket per ``fan`` children, minimum and maximum and count only."""
+    count = int(child.starts.size)
+    fan = int(fan)
+    first, last = _group_index(count, fan)
+    groups = int(first.size)
+    rung = _SlimRung(child.nominal * fan, child.starts[first].copy(), child.ends[last].copy())
+    rung.counts[:] = _group_sum(child.counts, count, groups, fan)
+    _group_minmax(
+        rung.mins, rung.maxs, rung.counts, child.mins, child.maxs, child.counts,
+        count, groups, fan,
+    )
+    return rung
 
 
 class _Rung:
@@ -526,11 +591,12 @@ def _merge_rung(child, fan):
 
 
 class ColumnCache:
-    """The ladder of one line: four values a bucket, from ``BASE`` samples up.
+    """The ladder of one line, from ``FINE`` samples up.
 
     Built once. A span asks for the coarsest bucket that starts where the
     cursor is and ends inside the span, and reads raw samples only until the
-    next alignment.
+    next multiple of ``FINE``. The rungs below ``BASE`` are the slim ones.
+    From ``BASE`` up each bucket also keeps the positive-only fold.
     """
 
     def __init__(self, data, pattern=None):
@@ -542,29 +608,37 @@ class ColumnCache:
         if pattern is None:
             self.pattern = PATTERN
         self.rungs = []
+        self.fine = []
         self._linear = self._positive = None
         if int(data.size) < BASE:
             return
         geometry = _rungs(int(data.size), self.pattern)
-        # Geometry is coarse-first. The values are folded fine-first, because
-        # a rung is the min and the max of the rung below it.
-        base = self._base_rung(geometry[-1])
-        fine = [base]
-        # geometry[-1] is the base; the coarser rungs sit in front of it.
-        # Rebuild the merges from the base so the values follow the same cuts.
-        child = base
-        # Walk the fan steps the geometry used: one merge per rung above the base.
-        for _level in range(len(geometry) - 1):
-            fan = _fan_at(self.pattern, len(fine) - 1)
-            child = _merge_rung(child, fan)
-            fine.append(child)
-        self.rungs = list(reversed(fine))
-        self._linear, self._positive = _pack_rungs(self.rungs)
+        base_at = next(index for index, rung in enumerate(geometry) if int(rung[0]) == BASE)
+        # geometry is coarse-first, so the fine rungs sit behind the base and
+        # the last of them is ``FINE``. Fold that one from the samples, then
+        # merge by fours up to the base. The base's own minimum and maximum
+        # are that merge; its positive copy is a scan, which is the only
+        # positive fold the ladder keeps.
+        slim = _SlimRung(*geometry[-1])
+        _column_extents(self.data, slim.starts, slim.ends, slim.mins, slim.maxs, slim.counts, False)
+        slim_levels = [slim]
+        while slim_levels[-1].nominal < BASE:
+            slim_levels.append(_merge_slim(slim_levels[-1], 4))
+        self.fine = list(reversed(slim_levels[:-1]))
+        base = self._base_rung(geometry[base_at], slim_levels[-1])
+        built = [base]
+        for step in range(base_at):
+            built.append(_merge_rung(built[-1], _fan_at(self.pattern, step)))
+        self.rungs = list(reversed(built))
+        self._linear = _pack_fields(self.rungs + self.fine, False)
+        self._positive = _pack_fields(self.rungs, True)
 
-    def _base_rung(self, geometry):
+    def _base_rung(self, geometry, linear):
         nominal, starts, ends = geometry
         rung = _Rung(nominal, starts, ends)
-        _column_extents(self.data, starts, ends, rung.mins, rung.maxs, rung.counts, False)
+        rung.mins[:] = linear.mins
+        rung.maxs[:] = linear.maxs
+        rung.counts[:] = linear.counts
         _column_extents(
             self.data, starts, ends, rung.pos_mins, rung.pos_maxs, rung.pos_counts, True,
         )
@@ -585,32 +659,33 @@ class ColumnCache:
         return float(mins[0]), float(maxs[0]), int(counts[0])
 
 
-def _pack_rungs(rungs):
+def _pack_fields(rungs, positive):
     """One flat copy of every rung, coarse first, so one query can run in numba.
 
     The per-column walk used to pull buckets out of Python objects. A window
     of a long line is hundreds of columns, and that walk was the whole cost.
+    ``positive`` selects the positive-only copy, which only the rungs from
+    ``BASE`` up carry.
     """
     nominals = np.empty(len(rungs), dtype=np.int64)
     offsets = np.zeros(len(rungs) + 1, dtype=np.int64)
     for index, rung in enumerate(rungs):
         nominals[index] = rung.nominal
         offsets[index + 1] = offsets[index] + int(rung.starts.size)
-    starts = np.concatenate([rung.starts for rung in rungs])
-    ends = np.concatenate([rung.ends for rung in rungs])
-    linear = (
-        nominals, offsets, starts, ends,
-        np.concatenate([rung.mins for rung in rungs]),
-        np.concatenate([rung.maxs for rung in rungs]),
-        np.concatenate([rung.counts for rung in rungs]),
+    if positive:
+        mins = np.concatenate([rung.pos_mins for rung in rungs])
+        maxs = np.concatenate([rung.pos_maxs for rung in rungs])
+        counts = np.concatenate([rung.pos_counts for rung in rungs])
+    else:
+        mins = np.concatenate([rung.mins for rung in rungs])
+        maxs = np.concatenate([rung.maxs for rung in rungs])
+        counts = np.concatenate([rung.counts for rung in rungs])
+    return (
+        nominals, offsets,
+        np.concatenate([rung.starts for rung in rungs]),
+        np.concatenate([rung.ends for rung in rungs]),
+        mins, maxs, counts,
     )
-    positive = (
-        nominals, offsets, starts, ends,
-        np.concatenate([rung.pos_mins for rung in rungs]),
-        np.concatenate([rung.pos_maxs for rung in rungs]),
-        np.concatenate([rung.pos_counts for rung in rungs]),
-    )
-    return linear, positive
 
 
 if njit is not None:
@@ -632,15 +707,16 @@ if njit is not None:
 
     @njit(parallel=True, cache=True)
     def _column_extents_ladder(
-        data, starts, ends, mins, maxs, counts, positive_only,
+        data, starts, ends, mins, maxs, counts, positive_only, reads,
         nominals, offsets, bucket_starts, bucket_ends, bucket_mins, bucket_maxs, bucket_counts,
     ):
         """Each column from the coarsest bucket that fits, raw only in the gaps.
 
-        The gaps are the samples before the next multiple of the base width,
+        The gaps are the samples before the next multiple of the finest width,
         at most that many, and they are folded here rather than one call per
-        sample. A column shorter than the base is the plain scan: a bucket
-        would be coarser than the column.
+        sample. A column shorter than that finest rung is the plain scan: no
+        bucket would fit inside it. ``reads`` counts those raw samples, not
+        the buckets and not the chord.
         """
         base = nominals[nominals.shape[0] - 1]
         nlevels = nominals.shape[0]
@@ -654,8 +730,10 @@ if njit is not None:
             seen = np.int64(0)
             if b - a < base:
                 lo, hi, seen = _fold_range(data, a, b, lo, hi, seen, positive_only)
+                reads[c] = b - a
             else:
                 at = a
+                raw = np.int64(0)
                 while at < b:
                     taken = np.int64(0)
                     for level in range(nlevels):
@@ -684,7 +762,7 @@ if njit is not None:
                         at += taken
                         continue
                     # No bucket starts here and still fits. The next one cannot
-                    # start before the next base alignment.
+                    # start before the next alignment of the finest rung.
                     if at % base == 0:
                         nxt = at + base
                     else:
@@ -692,7 +770,9 @@ if njit is not None:
                     if nxt > b:
                         nxt = b
                     lo, hi, seen = _fold_range(data, at, nxt, lo, hi, seen, positive_only)
+                    raw += nxt - at
                     at = nxt
+                reads[c] = raw
             if lo <= hi:
                 mins[c] = lo
                 maxs[c] = hi
@@ -755,165 +835,382 @@ def _scatter_pieces(lo, hi, seen, columns, piece_lo, piece_hi, piece_seen):
     np.add.at(seen, columns, piece_seen[ok])
 
 
-def _extents_buckets(data, starts, ends, mins, maxs, counts, positive_only, rung):
-    """Column extremes from the base buckets, with NumPy reductions only.
+def _scatter_raw(data, cols, starts, ends, lo, hi, seen, reads, positive_only):
+    """Fold raw slices into columns and count every sample they walk."""
+    if int(cols.size) == 0:
+        return
+    keep = ends > starts
+    if not np.any(keep):
+        return
+    cols = cols[keep]
+    starts = starts[keep]
+    ends = ends[keep]
+    np.add.at(reads, cols, ends - starts)
+    indices, bounds = _pieces(starts, ends)
+    block = data[indices]
+    if positive_only:
+        block = np.where(block > 0.0, block, np.nan)
+    present = np.logical_not(np.isnan(block)).astype(np.int64)
+    _scatter_pieces(
+        lo, hi, seen, cols,
+        np.fmin.reduceat(block, bounds),
+        np.fmax.reduceat(block, bounds),
+        np.add.reduceat(present, bounds),
+    )
 
-    A bucket that lies wholly inside a column contributes its minimum, its
-    maximum and its count. What is left is the head before the next alignment
-    and the tail after the last bucket that fit, gathered once and reduced
-    with the same ``fmin`` the plain scan uses. The last bucket of the line
-    may be shorter than the base width, so it is applied on its own.
+
+def _eat_rung(rung, cols, starts, ends, lo, hi, seen, positive_only):
+    """Cover whole buckets of one rung. What is left is the head and the tail.
+
+    A bucket that does not fit stays in the leftover, for a finer rung or for
+    the raw scan. The leftover of a fragment the rung does not touch is that
+    fragment, once, so a short span is not doubled at every level.
     """
-    base = int(rung.nominal)
-    limit = int(data.size)
-    starts = np.clip(np.asarray(starts, dtype=np.int64), 0, limit)
-    ends = np.clip(np.asarray(ends, dtype=np.int64), 0, limit)
     if positive_only:
         bmin, bmax, bcount = rung.pos_mins, rung.pos_maxs, rung.pos_counts
     else:
         bmin, bmax, bcount = rung.mins, rung.maxs, rung.counts
+    width = int(rung.nominal)
+    count = int(rung.starts.size)
+    align = ((starts + (width - 1)) // width) * width
+    i0 = align // width
+    i_lim = np.minimum(ends // width, count - 1)
+    use = (i_lim > i0) & (i0 >= 0) & (i0 < count)
     safe_min = np.where(bcount > 0, bmin, np.inf)
     safe_max = np.where(bcount > 0, bmax, -np.inf)
-    n = int(starts.shape[0])
-    nb = int(rung.starts.size)
-    lo = np.full(n, np.inf, dtype=np.float64)
-    hi = np.full(n, -np.inf, dtype=np.float64)
-    seen = np.zeros(n, dtype=np.int64)
-
-    i0 = (starts + (base - 1)) // base
-    # Every bucket except the last is exactly ``base`` long and ends on an
-    # alignment. The slice [i0, i_full) is those whole buckets.
-    i_full = np.minimum(ends // base, nb - 1)
-    use = (i_full > i0) & (i0 < nb) & (i0 >= 0)
     if np.any(use):
-        cols = np.flatnonzero(use)
-        indices, bounds = _pieces(i0[cols], i_full[cols])
-        piece_seen = np.add.reduceat(bcount[indices], bounds)
+        chosen = np.flatnonzero(use)
+        indices, bounds = _pieces(i0[chosen], i_lim[chosen])
         _scatter_pieces(
-            lo, hi, seen, cols,
+            lo, hi, seen, cols[chosen],
             np.minimum.reduceat(safe_min[indices], bounds),
             np.maximum.reduceat(safe_max[indices], bounds),
-            piece_seen,
+            np.add.reduceat(bcount[indices], bounds),
         )
-
-    last = nb - 1
+    last = count - 1
     last_start = int(rung.starts[last])
     last_end = int(rung.ends[last])
     take_last = (i0 <= last) & (ends >= last_end) & (starts <= last_start)
     if np.any(take_last) and int(bcount[last]) > 0:
-        lo[take_last] = np.minimum(lo[take_last], safe_min[last])
-        hi[take_last] = np.maximum(hi[take_last], safe_max[last])
-        seen[take_last] += int(bcount[last])
+        chosen = cols[take_last]
+        lo[chosen] = np.minimum(lo[chosen], safe_min[last])
+        hi[chosen] = np.maximum(hi[chosen], safe_max[last])
+        seen[chosen] += int(bcount[last])
+    cover_lo = np.where(use, align, ends)
+    cover_hi = np.where(use, i_lim.astype(np.int64) * width, cover_lo)
+    cover_lo = np.where(take_last & np.logical_not(use), last_start, cover_lo)
+    cover_hi = np.where(take_last, np.maximum(cover_hi, last_end), cover_hi)
+    return (
+        np.concatenate((cols, cols)),
+        np.concatenate((starts, np.maximum(cover_hi, starts))),
+        np.concatenate((np.minimum(cover_lo, ends), ends)),
+    )
 
-    head_hi = np.minimum(ends, i0 * base)
-    # Where no whole bucket fit, the tail continues the head so the two
-    # slices together are the column and nothing is read twice.
-    tail_lo = np.where(take_last, last_end, np.where(use, i_full * base, head_hi))
-    raw_starts = np.concatenate((starts, tail_lo))
-    raw_ends = np.concatenate((head_hi, ends))
-    raw_cols = np.concatenate((np.arange(n, dtype=np.int64), np.arange(n, dtype=np.int64)))
-    keep = raw_ends > raw_starts
-    if np.any(keep):
-        indices, bounds = _pieces(raw_starts[keep], raw_ends[keep])
-        block = data[indices]
-        if positive_only:
-            block = np.where(block > 0.0, block, np.nan)
-        present = np.logical_not(np.isnan(block)).astype(np.int64)
-        _scatter_pieces(
-            lo, hi, seen, raw_cols[keep],
-            np.fmin.reduceat(block, bounds),
-            np.fmax.reduceat(block, bounds),
-            np.add.reduceat(present, bounds),
-        )
 
+def _extents_rungs(data, starts, ends, mins, maxs, counts, positive_only, rungs, reads):
+    """The NumPy ladder. Same buckets as the parallel walk, reduced in arrays.
+
+    A column shorter than the finest rung is read. Every coarser bucket that
+    fits is taken, and the samples no bucket covered are the only raw read.
+    """
+    n = int(starts.shape[0])
+    lo = np.full(n, np.inf, dtype=np.float64)
+    hi = np.full(n, -np.inf, dtype=np.float64)
+    seen = np.zeros(n, dtype=np.int64)
+    finest = int(rungs[-1].nominal)
+    index = np.arange(n, dtype=np.int64)
+    short = (ends - starts) < finest
+    if np.any(short):
+        _scatter_raw(data, index[short], starts[short], ends[short], lo, hi, seen, reads, positive_only)
+    live = (ends - starts) >= finest
+    cols = index[live]
+    left = starts[live]
+    right = ends[live]
+    for rung in rungs:
+        if int(cols.size) == 0:
+            break
+        cols, left, right = _eat_rung(rung, cols, left, right, lo, hi, seen, positive_only)
+        keep = right > left
+        cols = cols[keep]
+        left = left[keep]
+        right = right[keep]
+    if int(cols.size):
+        _scatter_raw(data, cols, left, right, lo, hi, seen, reads, positive_only)
     good = (seen > 0) & (lo <= hi)
     mins[good] = lo[good]
     maxs[good] = hi[good]
     counts[good] = seen[good]
 
 
-def _buckets_skip_the_fringe(starts, ends):
-    """True when whole buckets hold more samples than the fringes around them.
 
-    A fringe is at most two base widths, one at each end, and gathering it
-    costs more per sample than one reduction straight through the column. The
-    buckets are the smaller read once they cover more than that fringe.
-    """
-    widths = np.maximum(ends - starts, 0)
-    inside = np.maximum(widths - 2 * BASE, 0)
-    return int(inside.sum()) > int(widths.sum() - inside.sum())
+def _near(left, right):
+    scale = max(1.0, abs(left), abs(right))
+    return abs(left - right) <= 1e-9 * scale
 
 
 def _extents(data, starts, ends, mins, maxs, counts, positive_only, cache):
-    """The column scan, from the ladder where a column holds a base bucket.
+    """The column scan. Returns how many raw samples it walked.
 
-    With numba the walk is one parallel pass. Without it, a column that holds
-    several base buckets is a ``reduceat`` over those buckets plus one gathered
-    reduction of the unaligned edges. Fewer buckets than that, and the plain
-    reduction of the samples is the smaller read. A Python walk of the edges
-    was the delay on a full window.
+    A column at least as wide as the finest rung of the ladder in use is
+    answered from that ladder. On a linear axis the finest rung is ``FINE``,
+    so a wide view reads the unaligned fringe and not the column. On a
+    logarithmic y the finest rung is ``BASE``: the fine rungs do not separate
+    a positive sample, and a column shorter than ``BASE`` is read. With numba
+    the walk is one parallel pass. Without it, the same buckets are reduced
+    with ``reduceat``. The chord is not part of this count.
     """
-    wide = cache is not None and cache.rungs and np.any(ends - starts >= BASE)
-    if not wide:
+    reads = np.zeros(int(starts.shape[0]), dtype=np.int64)
+    finest = BASE if positive_only else FINE
+    use_ladder = (
+        cache is not None and cache.rungs
+        and np.any(ends - starts >= finest)
+    )
+    if not use_ladder:
         _column_extents(data, starts, ends, mins, maxs, counts, positive_only)
-        return
+        span = np.maximum(ends - starts, 0)
+        return int(span.sum())
+    packed = cache._positive if positive_only else cache._linear
     if _column_extents_ladder is not None:
-        packed = cache._positive if positive_only else cache._linear
         _column_extents_ladder(
-            cache.data, starts, ends, mins, maxs, counts, bool(positive_only), *packed,
+            cache.data, starts, ends, mins, maxs, counts, bool(positive_only), reads, *packed,
         )
-        return
-    if _buckets_skip_the_fringe(starts, ends):
-        _extents_buckets(
-            cache.data, starts, ends, mins, maxs, counts, bool(positive_only), cache.rungs[-1],
-        )
-        return
-    _column_extents(data, starts, ends, mins, maxs, counts, positive_only)
+        return int(reads.sum())
+    rungs = cache.rungs if positive_only else list(cache.rungs) + list(cache.fine)
+    _extents_rungs(
+        cache.data, starts, ends, mins, maxs, counts, bool(positive_only), rungs, reads,
+    )
+    return int(reads.sum())
 
 
-def envelope(data, x0, x1, columns, x=None, log_x=False, log_y=False, cache=None, anchored=False):
+def _shift_into(values, shift):
+    """Slide ``values`` by whole columns. Positive drops the left."""
+    if shift > 0:
+        values[:-shift] = values[shift:].copy()
+    elif shift < 0:
+        step = -shift
+        values[step:] = values[:-step].copy()
+
+
+def _apply_chords(data, x, edges, mins, maxs, first, last, log_x, log_y):
+    for column in range(int(first), int(last)):
+        left = float(edges[column])
+        right = float(edges[column + 1])
+        if x is None:
+            _include(mins, maxs, column, y_on_chord(data, left, log_x, log_y))
+            _include(mins, maxs, column, y_on_chord(data, right, log_x, log_y))
+        else:
+            _include(mins, maxs, column, _chord_time(x, data, left, log_x, log_y))
+            _include(mins, maxs, column, _chord_time(x, data, right, log_x, log_y))
+
+
+class ColumnScratch:
+    """The columns of one line, kept so a pan can slide them.
+
+    A pan by whole columns moves each sample with the column it was already
+    in. The columns that stay are slid, and only the strip that entered is
+    walked. A pan that does not cross a column walks nothing. Zoom, a
+    different width, a log change or a new array fills every column again.
+    """
+
+    __slots__ = (
+        "mins", "maxs", "counts", "valid", "columns", "width", "origin",
+        "log_x", "log_y", "data_id", "count", "first", "last", "x_id",
+        "x_first", "x_last", "samples_read", "columns_filled",
+    )
+
+    def __init__(self):
+        self.mins = None
+        self.maxs = None
+        self.counts = None
+        self.valid = False
+        self.columns = 0
+        self.width = 0.0
+        self.origin = 0.0
+        self.log_x = False
+        self.log_y = False
+        self.data_id = None
+        self.count = 0
+        self.first = 0.0
+        self.last = 0.0
+        self.x_id = None
+        self.x_first = 0.0
+        self.x_last = 0.0
+        self.samples_read = 0
+        self.columns_filled = 0
+
+    def drop(self):
+        self.valid = False
+
+    def prepare(self, columns):
+        columns = int(columns)
+        self.mins = np.full(columns, np.nan, dtype=np.float64)
+        self.maxs = np.full(columns, np.nan, dtype=np.float64)
+        self.counts = np.zeros(columns, dtype=np.int64)
+        self.columns = columns
+        self.valid = False
+
+    def shift_of(self, data, x, columns, width, origin, log_x, log_y):
+        """Whole columns the window moved, or None when nothing can slide."""
+        if not self.valid or self.columns != int(columns):
+            return None
+        if self.log_x != bool(log_x) or self.log_y != bool(log_y):
+            return None
+        if self.data_id != id(data) or self.count != int(data.size) or int(data.size) == 0:
+            return None
+        if not _near(self.first, float(data[0])) or not _near(self.last, float(data[-1])):
+            return None
+        x_id = None if x is None else id(x)
+        if self.x_id != x_id:
+            return None
+        if x is not None and (
+            int(x.size) == 0
+            or not _near(self.x_first, float(x[0]))
+            or not _near(self.x_last, float(x[-1]))
+        ):
+            return None
+        if not _near(self.width, float(width)):
+            return None
+        shifted = float(origin) - float(self.origin)
+        shift = int(round(shifted))
+        if abs(shifted - float(shift)) > 1e-6 or abs(shift) >= int(columns):
+            return None
+        return shift
+
+    def remember(self, data, x, width, origin, log_x, log_y):
+        self.valid = True
+        self.data_id = id(data)
+        self.count = int(data.size)
+        self.first = float(data[0])
+        self.last = float(data[-1])
+        self.x_id = None if x is None else id(x)
+        if x is None:
+            self.x_first = 0.0
+            self.x_last = 0.0
+        else:
+            self.x_first = float(x[0])
+            self.x_last = float(x[-1])
+        self.width = float(width)
+        self.origin = float(origin)
+        self.log_x = bool(log_x)
+        self.log_y = bool(log_y)
+
+
+def envelope(
+    data, x0, x1, columns, x=None, log_x=False, log_y=False, cache=None, anchored=False,
+    scratch=None,
+):
     """Min, max and sample count per column over ``[x0, x1)``.
 
     ``x`` is a monotonic time base, one value per sample. Without it, sample
     ``i`` is at ``i`` and the window is an index window. Returns mins, maxs,
     counts and the column edges (``columns + 1`` of them).
 
-    ``cache`` is a :class:`ColumnCache` of this same array. A column of at
-    least ``BASE`` samples is then read from it. The chord below still uses
-    the samples on either side of each edge.
+    ``cache`` is a :class:`ColumnCache` of this same array. A linear column of
+    at least ``FINE`` samples is read from it, and a logarithmic column of at
+    least ``BASE`` samples. The chord still uses the samples on either side
+    of each edge, and it is not part of :attr:`samples_read`.
 
     ``anchored`` places the columns on :func:`_anchored_edges`, so a pan keeps
-    each sample in the column it was in.
+    each sample in the column it was in. ``scratch`` is a :class:`ColumnScratch`
+    kept for this line. A later pan by whole columns slides it and fills only
+    the strip that entered. :attr:`samples_read` is the raw samples that strip
+    walked, and :attr:`columns_filled` is how many columns were walked.
     """
     columns = int(columns)
+    log_x = bool(log_x)
+    log_y = bool(log_y)
+    anchored = bool(anchored)
     data = np.asarray(data)
     if data.dtype != np.float64 or not data.flags.c_contiguous:
         data = np.ascontiguousarray(data, dtype=np.float64)
+    if x is not None:
+        x = np.asarray(x)
+        if x.dtype != np.float64 or not x.flags.c_contiguous:
+            x = np.ascontiguousarray(x, dtype=np.float64)
+    width = origin = None
     if anchored:
-        edges = _anchored_edges(float(x0), float(x1), columns, log_x)
+        grid = _grid(float(x0), float(x1), columns, log_x)
+        edges = None if grid is None else grid[2]
+        if grid is not None:
+            width, origin = grid[0], grid[1]
     else:
         edges = _edges(float(x0), float(x1), columns, log_x)
-    mins = np.full(max(columns, 0), np.nan, dtype=np.float64)
-    maxs = np.full(max(columns, 0), np.nan, dtype=np.float64)
-    counts = np.zeros(max(columns, 0), dtype=np.int64)
+
+    def finish(reads, filled, out_mins, out_maxs, out_counts, out_edges):
+        envelope.samples_read = int(reads)
+        envelope.columns_filled = int(filled)
+        if scratch is not None:
+            scratch.samples_read = int(reads)
+            scratch.columns_filled = int(filled)
+        return out_mins, out_maxs, out_counts, out_edges
+
     if edges is None:
-        return mins, maxs, counts, np.empty(0, dtype=np.float64)
+        empty = max(columns, 0)
+        if scratch is not None:
+            scratch.drop()
+        return finish(
+            0, 0,
+            np.full(empty, np.nan, dtype=np.float64),
+            np.full(empty, np.nan, dtype=np.float64),
+            np.zeros(empty, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+        )
 
     samples = int(data.size)
     if x is None:
         starts, ends = _index_spans(edges, samples)
     else:
-        x = np.asarray(x)
-        if x.dtype != np.float64 or not x.flags.c_contiguous:
-            x = np.ascontiguousarray(x, dtype=np.float64)
         starts, ends = _time_spans(x, edges)
-    _extents(data, starts, ends, mins, maxs, counts, bool(log_y), cache)
 
-    for column in range(columns):
-        if x is None:
-            _include(mins, maxs, column, y_on_chord(data, float(edges[column]), log_x, log_y))
-            _include(mins, maxs, column, y_on_chord(data, float(edges[column + 1]), log_x, log_y))
+    shift = None
+    if scratch is not None and anchored and width is not None and samples:
+        shift = scratch.shift_of(data, x, columns, width, origin, log_x, log_y)
+    if shift is not None:
+        if shift != 0:
+            _shift_into(scratch.mins, shift)
+            _shift_into(scratch.maxs, shift)
+            _shift_into(scratch.counts, shift)
+        if shift > 0:
+            fill_from = columns - shift
+            fill_to = columns
+        elif shift < 0:
+            fill_from = 0
+            fill_to = -shift
         else:
-            _include(mins, maxs, column, _chord_time(x, data, edges[column], log_x, log_y))
-            _include(mins, maxs, column, _chord_time(x, data, edges[column + 1], log_x, log_y))
-    return mins, maxs, counts, edges
+            fill_from = 0
+            fill_to = 0
+        if fill_to > fill_from:
+            scratch.mins[fill_from:fill_to] = np.nan
+            scratch.maxs[fill_from:fill_to] = np.nan
+            scratch.counts[fill_from:fill_to] = 0
+            reads = _extents(
+                data, starts[fill_from:fill_to], ends[fill_from:fill_to],
+                scratch.mins[fill_from:fill_to], scratch.maxs[fill_from:fill_to],
+                scratch.counts[fill_from:fill_to], log_y, cache,
+            )
+            _apply_chords(
+                data, x, edges, scratch.mins, scratch.maxs, fill_from, fill_to, log_x, log_y,
+            )
+        else:
+            reads = 0
+        scratch.remember(data, x, width, origin, log_x, log_y)
+        return finish(reads, fill_to - fill_from, scratch.mins, scratch.maxs, scratch.counts, edges)
+
+    if scratch is not None:
+        scratch.prepare(columns)
+        mins, maxs, counts = scratch.mins, scratch.maxs, scratch.counts
+    else:
+        mins = np.full(columns, np.nan, dtype=np.float64)
+        maxs = np.full(columns, np.nan, dtype=np.float64)
+        counts = np.zeros(columns, dtype=np.int64)
+    reads = _extents(data, starts, ends, mins, maxs, counts, log_y, cache)
+    _apply_chords(data, x, edges, mins, maxs, 0, columns, log_x, log_y)
+    if scratch is not None and anchored and width is not None and samples:
+        scratch.remember(data, x, width, origin, log_x, log_y)
+    elif scratch is not None:
+        scratch.drop()
+    return finish(reads, columns, mins, maxs, counts, edges)
+
+
+envelope.samples_read = 0
+envelope.columns_filled = 0

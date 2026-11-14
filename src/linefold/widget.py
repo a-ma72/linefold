@@ -219,6 +219,20 @@ def _place_beside(box, pane_w, pane_h, avoid):
     return None
 
 
+# A crowded pane keeps a turning point a speck. A close look gives it room,
+# up to a cap so a lone point does not become a disc.
+_MARKER_MIN = 1.5
+_MARKER_MAX = 7.0
+_MARKER_SHARE = 4.0
+
+
+def _marker_radius(on_pane: int, width: int) -> float:
+    """Logical pixels. Many points on the pane stay small; few grow."""
+    if on_pane <= 0 or width <= 0:
+        return _MARKER_MIN
+    return min(_MARKER_MAX, max(_MARKER_MIN, width / on_pane / _MARKER_SHARE))
+
+
 def _mark_samples(on_pane: int, width: int) -> bool:
     """A sample on the pane gets a mark once it has room of its own.
 
@@ -403,8 +417,8 @@ class PlotWidget(QWidget):
         self._plot.reset_view()
         self._reproject()
 
-    def add_line(self, y, colour=None, name=None):
-        index = self._plot.add_line(y, colour, name)
+    def add_line(self, y, colour=None, name=None, *, markers=False):
+        index = self._plot.add_line(y, colour, name, markers=markers)
         self._plot.reset_view()
         self._reproject()
         return index
@@ -883,6 +897,9 @@ class PlotWidget(QWidget):
         for run in self._runs:
             colour = QColor(run.red, run.green, run.blue, run.alpha)
             pts = self._xy[run.first:run.first + run.count]
+            if run.markers:
+                self._paint_markers(stroke, pts, colour, width, height, ratio)
+                continue
             spans = _finite_spans(pts)
             # A summary is a vertical per column. A pen wider than one device
             # pixel turns that hairpin into the slow stroke; the ratio is
@@ -928,6 +945,24 @@ class PlotWidget(QWidget):
                     stroke.drawEllipse(x - radius, y - radius, radius * 2, radius * 2)
         stroke.end()
         return image
+
+    def _paint_markers(self, stroke, pts, colour, width, height, ratio) -> None:
+        """Circles only. A marked sample is a point, never a stroke to the next."""
+        stroke.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        stroke.setBrush(colour)
+        stroke.setPen(Qt.PenStyle.NoPen)
+        on_pane = int(np.count_nonzero(
+            np.isfinite(pts[:, 0]) & (pts[:, 0] >= 0.0) & (pts[:, 0] <= width)
+        ))
+        radius = _marker_radius(on_pane, width) * ratio
+        for px, py in pts:
+            if not math.isfinite(px) or not math.isfinite(py):
+                continue
+            if px < -4.0 or px > width + 4.0 or py < -4.0 or py > height + 4.0:
+                continue
+            x = float(px) * ratio
+            y = float(py) * ratio
+            stroke.drawEllipse(x - radius, y - radius, radius * 2.0, radius * 2.0)
 
     def resizeEvent(self, event: QResizeEvent):
         super().resizeEvent(event)

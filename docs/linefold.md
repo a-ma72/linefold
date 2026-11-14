@@ -40,39 +40,43 @@ When a column holds several samples, and the vertical from its minimum to its ma
 
 A crowded column whose vertical is shorter than a pixel is not drawn as a dot. On a logarithmic x axis the first columns are the narrow ones, and a small amplitude there is shorter than the pen. An isolated vertical of no height, followed by a gap, would read as a dotted line. The chord is the stroke instead.
 
+A shallow column whose right edge lies past the last sample has no chord there. The stroke stops on that sample, which is still inside the column. Carrying the last value out to the edge would run a short line on to the frame, and dropping the column would leave the end off the line. An edge before the first sample stays a gap.
+
 A gap in the data stays a gap. Logarithmic axes drop values they cannot draw, and those dropped values are gaps too.
 
 ### The ladder
 
 A line of at least `BASE` samples (1024) keeps a ladder of the same fold, built once in `ColumnCache`. A shorter line has no ladder. Every later window of a long line reads the ladder instead of walking the samples again.
 
-The bottom rung cuts the line into buckets of 1024 samples. The last bucket is shorter when the line does not fill it, and it still starts on the alignment. Each bucket stores six values, twice:
+The finest rung cuts the line into buckets of `FINE` samples (4). The last bucket is shorter when the line does not fill it, and it still starts on the alignment. From 4 up to 1024 the fan is four, so the rungs are 4, 16, 64, 256 and 1024. A bucket below 1024 stores three numbers: the minimum, the maximum, and the count of finite samples. Those rungs are most of the ladder's memory. They do not keep a first sample, a last sample, or a positive copy.
+
+From 1024 up, each bucket stores six values, twice:
 
 - the first sample and the last sample
 - the minimum, the maximum, and the count of finite samples
 - the same three numbers counted only where the sample is strictly positive
 
-The positive copy is what a logarithmic y axis reads. Building it once means a log view does not rescan the line.
+The positive copy is what a logarithmic y axis reads. The fine rungs do not separate a positive sample from the rest, so a logarithmic column shorter than 1024 is still read from the samples. A column of identical samples keeps its count, so it stays a crowded column: the ladder does not have to walk it again to tell one sample from many.
 
-Coarser rungs are exact merges of the rung below. A group of children becomes one bucket. The minimum and maximum are the minimum and maximum of the children that hold a sample. An empty child does not move the extremes. The count is the sum of the counts. The first sample of the bucket is the first child's first sample, and the last sample is the last child's last sample. The tail group is short and still exact.
+Coarser rungs are exact merges of the rung below. A group of children becomes one bucket. The minimum and maximum are the minimum and maximum of the children that hold a sample. An empty child does not move the extremes. The count is the sum of the counts. From 1024 up, the first sample of the bucket is the first child's first sample, and the last sample is the last child's last sample. The tail group is short and still exact.
 
-The fan, how many children become one parent, is chosen once for the ladder:
+The fan above 1024, how many children become one parent, is chosen once for the ladder:
 
 - fours all the way up
 - twos all the way up
 - a taper: fours, then threes, then twos
 
-The taper is the one that is kept when, over a fixed set of spans a long line actually asks for, it reads no more buckets than the twos and stores no more buckets than the fours. The small rungs dominate the store, so the extra large sizes the taper keeps are the whole of the difference. When that test fails, the ladder is built in fours.
+The taper is the one that is kept when, over a fixed set of spans a long line actually asks for, it reads no more buckets than the twos and stores no more buckets than the fours. The fine rungs are in that store, and they are the same four-wide ladder for every schedule, so what still decides it is the rungs above 1024. Measured over that probe, the taper stores more than the fours, so the ladder is built in fours.
 
-A span does not walk every rung. It asks for the coarsest bucket that starts where the cursor is and still ends inside the span. Samples between alignments are not buckets. They are one slice of the raw line, read up to the next multiple of 1024. The chord at a column edge is still the two raw samples beside that edge, so the picture is the one the plain scan draws.
+A span does not walk every rung. It asks for the coarsest bucket that starts where the cursor is and still ends inside the span. Samples between alignments are not buckets. They are one slice of the raw line, read up to the next multiple of 4. On a logarithmic y that slice runs to the next multiple of 1024, because the fine rungs are not used. The chord at a column edge is still the two raw samples beside that edge, so the picture is the one the plain scan draws.
 
 ### The fast path, and the same answer without it
 
-The rungs are packed into flat arrays, coarse first. A window of a long line is hundreds of columns, and pulling buckets out of Python objects was the whole cost. With numba installed (`pip install "linefold[numba]"`), one parallel pass reads those arrays. Without numba, the three answers are computed in NumPy.
+The rungs are packed into flat arrays, coarse first. A window of a long line is hundreds of columns, and pulling buckets out of Python objects was the whole cost. With numba installed (`pip install "linefold[numba]"`), one parallel pass reads those arrays. Without numba, the same buckets are reduced together and the unaligned fringe is gathered once.
 
-NumPy does not imitate the parallel walk. A column narrower than `BASE` is a plain reduction of its samples. A wider column uses the base buckets when those buckets hold more samples than the two fringes around them. A fringe is at most two base widths, one at each end, and gathering it costs more per sample than one reduction straight through the column. The unaligned edges are gathered and reduced once. Fewer buckets than that, and the plain reduction is the smaller read. A NaN still fails both comparisons, and a value at or below zero is still left out of a logarithmic column. The two paths agree.
+A linear column shorter than 4 samples is a plain reduction. A logarithmic column shorter than 1024 is a plain reduction. Anything wider is the ladder. A NaN still fails both comparisons, and a value at or below zero is still left out of a logarithmic column. The two paths agree.
 
-The ladder is not rebuilt when the window moves. `project` passes `line.column_cache()` into `envelope` on every frame.
+The ladder is not rebuilt when the window moves. `project` passes the line's ladder and its `ColumnScratch` into `envelope` on every frame. The scratch remembers the anchored grid. A pan by whole columns slides the columns that stay on screen and fills only the strip that entered. A pan that does not cross a column fills nothing. Zoom, a resize, a log change or a new array fills every column again, because the grid is no longer the one that was folded.
 
 ### Drawing the reduced line
 
