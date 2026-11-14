@@ -92,7 +92,7 @@ class _Line:
         "y", "x", "explicit_x", "monotonic_x", "colour", "name", "own", "markers",
         "scale_y", "shift_y", "y_log", "y_span", "y_low", "y_high", "y_pos",
         "x_low", "x_high", "x_pos",
-        "_cache", "_cached_y", "_scratch",
+        "_cache", "_cached_y", "_scratch", "_finite", "_finite_y", "_finite_x",
     )
 
     def __init__(self, y, colour, name):
@@ -115,6 +115,9 @@ class _Line:
         self._cache = None
         self._cached_y = None
         self._scratch = ColumnScratch()
+        self._finite = None
+        self._finite_y = None
+        self._finite_x = None
         self._read_y()
 
     def column_cache(self):
@@ -667,6 +670,79 @@ def _drawable_sample(x: float, y: float, log_x: bool, log_y: bool) -> bool:
     if log_y and not y > 0.0:
         return False
     return True
+
+
+def _finite_index(line) -> np.ndarray:
+    """Sample indices that are points. Kept until the arrays are replaced."""
+    if line._finite is not None and line._finite_y is line.y and line._finite_x is line.x:
+        return line._finite
+    mask = np.isfinite(line.y)
+    if line.monotonic_x and line.x is not None:
+        mask = mask & np.isfinite(line.x)
+    line._finite = np.flatnonzero(mask)
+    line._finite_y = line.y
+    line._finite_x = line.x
+    return line._finite
+
+
+def _marks_in_window(line, x0, x1, columns, log_x, log_y):
+    """Finite samples inside the window, thinned to two per column when crowded."""
+    index = _finite_index(line)
+    if index.size == 0:
+        empty = np.zeros(0, dtype=np.intp)
+        return empty, np.zeros(0, dtype=np.float64)
+    positions = line.x[index] if line.monotonic_x else index.astype(np.float64)
+    left = int(np.searchsorted(positions, x0, side="left"))
+    right = int(np.searchsorted(positions, x1, side="right"))
+    index = index[left:right]
+    positions = positions[left:right]
+    if log_x:
+        keep = positions > 0.0
+        index = index[keep]
+        positions = positions[keep]
+    if log_y:
+        keep = line.y[index] > 0.0
+        index = index[keep]
+        positions = positions[keep]
+    if index.size > columns:
+        index, positions = _thin_marks(index, line.y, positions, x0, x1, columns, log_x)
+    return index, positions
+
+
+def _thin_marks(index, y, positions, x0, x1, columns, log_x):
+    """The lowest and the highest sample of each column the points fall in."""
+    if log_x and x0 > 0.0 and x1 > x0:
+        fraction = (np.log(positions) - math.log(x0)) / (math.log(x1) - math.log(x0))
+    else:
+        span = x1 - x0
+        fraction = (positions - x0) / span if span > 0.0 else np.zeros(positions.size)
+    column = np.floor(fraction * columns).astype(np.intp)
+    np.clip(column, 0, columns - 1, out=column)
+    order = np.argsort(column, kind="mergesort")
+    ordered = column[order]
+    splits = np.flatnonzero(ordered[1:] != ordered[:-1]) + 1
+    starts = np.empty(splits.size + 1, dtype=np.intp)
+    starts[0] = 0
+    if splits.size:
+        starts[1:] = splits
+    stops = np.empty_like(starts)
+    stops[-1] = ordered.size
+    if splits.size:
+        stops[:-1] = splits
+    values = y[index][order]
+    keep = np.empty(starts.size * 2, dtype=np.intp)
+    count = 0
+    for start, stop in zip(starts, stops, strict=True):
+        block = values[start:stop]
+        low = int(np.argmin(block))
+        high = int(np.argmax(block))
+        keep[count] = order[start + low]
+        count += 1
+        if high != low:
+            keep[count] = order[start + high]
+            count += 1
+    keep = np.sort(keep[:count])
+    return index[keep], positions[keep]
 
 
 def _sample_window(line, x0: float, x1: float) -> tuple[int, int]:
@@ -1390,17 +1466,24 @@ class Plot:
     def _project_markers(
         self, xs, ys, pxs, pys, vertices, runs, owners, index, line, x0, x1, log_x,
     ) -> None:
-        """One vertex per finite sample in the window, and no segment between them."""
+        """Finite samples in the window, at most the low and high of a column.
+
+        The gaps are NaN, so a walk of the whole series spends its time on
+        samples that are not points. The finite indices are kept. More points
+        than columns would be drawn on top of each other, so a crowded column
+        keeps the lowest and the highest and drops the rest.
+        """
         log_y = self.line_y_log(index)
         low, high = self.line_y_range(index)
         first = len(xs)
-        start, stop = _sample_window(line, x0, x1)
-        for i in range(start, stop):
-            x = float(line.x[i]) if line.monotonic_x else float(i)
-            y = float(line.y[i])
-            if x < x0 or x > x1 or not _drawable_sample(x, y, log_x, log_y):
-                continue
-            self._push(xs, ys, pxs, pys, vertices, index, x, y, low, high, log_y, line.colour)
+        columns = max(1, int(round(self._width * self._ratio)))
+        chosen, positions = _marks_in_window(line, x0, x1, columns, log_x, log_y)
+        for sample, position in zip(chosen, positions, strict=True):
+            y = float(line.y[int(sample)])
+            self._push(
+                xs, ys, pxs, pys, vertices, index, float(position), y,
+                low, high, log_y, line.colour,
+            )
         count = len(xs) - first
         if count > 0:
             runs.append(_Run(first, count, line.colour, False, markers=True))
