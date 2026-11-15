@@ -1057,6 +1057,10 @@ class Plot:
     def y_log_base(self) -> float:
         return self._camera.y_base
 
+    def x_zoom(self) -> float:
+        """How far the x window sits inside the whole axis. One is the full record."""
+        return float(self._camera.zoom_x)
+
     def x_log(self) -> bool:
         return self._camera.x_log
 

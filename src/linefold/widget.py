@@ -37,6 +37,7 @@ from .plot import Plot
 _TOP = 8
 _RIGHT = 12
 _BOTTOM = 28
+_X_TICK = 6
 _OWN_COLUMN = 64
 
 
@@ -71,6 +72,45 @@ def _log_label(value: float, base: float = 10.0) -> str:
     else:
         lead = format(coefficient, ".6g")
     return lead + "×" + power + _raised(exponent)
+
+
+def _linear_minor_xs(ticks, width: float) -> list[float]:
+    """Pane x of the short marks between labeled linear ticks.
+
+    A step of 2·10ⁿ is split in four, every other 1-2-5 step in five.
+    """
+    labeled = [
+        tick for tick in ticks if tick.axis == 0 and tick.labeled and not tick.logarithmic
+    ]
+    if len(labeled) < 2 or not width > 0.0:
+        return []
+    step = labeled[1].value - labeled[0].value
+    if not step > 0.0:
+        return []
+    magnitude = 10.0 ** round(math.log10(step))
+    if not magnitude > 0.0:
+        return []
+    divisions = 4 if abs(step / magnitude - 2.0) < 0.15 else 5
+    minor = step / divisions
+    scale = (labeled[1].x - labeled[0].x) / step
+    if not scale > 0.0:
+        return []
+    origin = labeled[0].value - labeled[0].x / scale
+    first = math.ceil(origin / minor - 1e-6)
+    last = math.floor((origin + width / scale) / minor + 1e-6)
+    marks: list[float] = []
+    for index in range(int(first), int(last) + 1):
+        value = index * minor
+        nearest = round(value / step)
+        if abs(value - nearest * step) <= step * 1e-3:
+            continue
+        x = labeled[0].x + (value - labeled[0].value) * scale
+        if x < -0.5 or x > width + 0.5:
+            continue
+        marks.append(x)
+        if len(marks) >= 64:
+            break
+    return marks
 
 
 def _tick_text(tick, x_base: float, y_base: float, x_span: float, y_span: float) -> str:
@@ -219,18 +259,17 @@ def _place_beside(box, pane_w, pane_h, avoid):
     return None
 
 
-# A crowded pane keeps a turning point a speck. A close look gives it room,
-# up to a cap so a lone point does not become a disc.
+# The whole record keeps a turning point a speck. Zooming in grows it, and
+# the cap is half the old maximum diameter so a close look stays a mark.
 _MARKER_MIN = 1.5
-_MARKER_MAX = 7.0
-_MARKER_SHARE = 4.0
+_MARKER_MAX = 3.5
 
 
-def _marker_radius(on_pane: int, width: int) -> float:
-    """Logical pixels. Many points on the pane stay small; few grow."""
-    if on_pane <= 0 or width <= 0:
-        return _MARKER_MIN
-    return min(_MARKER_MAX, max(_MARKER_MIN, width / on_pane / _MARKER_SHARE))
+def _marker_radius(zoom: float) -> float:
+    """Logical pixels. The same zoom draws every mark the same size."""
+    if not math.isfinite(zoom) or zoom < 1.0:
+        zoom = 1.0
+    return min(_MARKER_MAX, _MARKER_MIN * math.sqrt(zoom))
 
 
 def _mark_samples(on_pane: int, width: int) -> bool:
@@ -322,6 +361,8 @@ class PlotWidget(QWidget):
         self._legend_rect = None
         self._x_label = ""
         self._y_label = ""
+        self._x_scale_visible = True
+        self._y_gutter = 0
         self._stroke = QImage()
         self.setMinimumSize(240, 160)
         self.setMouseTracking(True)
@@ -388,14 +429,122 @@ class PlotWidget(QWidget):
                 "num_x": x + name_w,
             })
             x += name_w + _OWN_COLUMN
+        shift = max(0, self._y_gutter - x)
+        if shift:
+            for column in columns:
+                column["name_x"] += shift
+                column["num_x"] += shift
+            x += shift
         return columns, x
 
     def _pane(self) -> tuple[int, int, int, int]:
         _columns, left = self._y_layout()
-        bottom = _BOTTOM + (self._name_extent() if self._x_label else 0)
+        if self._x_scale_visible:
+            bottom = _BOTTOM + (self._name_extent() if self._x_label else 0)
+        else:
+            bottom = 4
         width = max(1, self.width() - left - _RIGHT)
         height = max(1, self.height() - _TOP - bottom)
         return left, _TOP, width, height
+
+    def set_x_scale_visible(self, visible: bool) -> None:
+        """Keep or drop the x numbers and the axis name under this pane.
+
+        Linked panes share one scale drawn elsewhere. The vertical rules stay,
+        so that scale still reads against the curve.
+        """
+        visible = bool(visible)
+        if self._x_scale_visible == visible:
+            return
+        self._x_scale_visible = visible
+        self._reproject()
+
+    def set_y_gutter(self, width: int) -> None:
+        """Reserve this much of the left side for y axes.
+
+        Linked panes pass the widest gutter, so every data rectangle starts
+        at the same x and has the same width.
+        """
+        width = max(0, int(width))
+        if width == self._y_gutter:
+            return
+        self._y_gutter = width
+        self._reproject()
+
+    def y_axis_width(self) -> int:
+        """The y columns this pane needs, before a shared gutter pads them."""
+        held = self._y_gutter
+        self._y_gutter = 0
+        try:
+            return self._y_layout()[1]
+        finally:
+            self._y_gutter = held
+
+    def x_scale_height(self) -> int:
+        """The strip a shared x scale needs: the ticks, the numbers, the name."""
+        return _X_TICK + _BOTTOM + (self._name_extent() if self._x_label else 0)
+
+    def x_tick_labels(self) -> list[str]:
+        """The x numbers the pane would write under its rules."""
+        span_x = self._plot.view_max_x() - self._plot.view_min_x()
+        span_y = self._plot.view_max_y() - self._plot.view_min_y()
+        return [
+            _tick_text(
+                tick,
+                self._plot.x_log_base(),
+                self._plot.y_log_base(),
+                span_x,
+                span_y,
+            )
+            for tick in self._ticks
+            if tick.axis == 0 and tick.labeled
+        ]
+
+    def paint_x_scale(self, painter: QPainter) -> None:
+        """Draw this pane's x ticks, numbers and axis name into another widget.
+
+        Coordinates match the pane: the caller's left edge is this widget's.
+        """
+        left, _top, width, _height = self._pane()
+        metrics = QFontMetrics(painter.font())
+        ink = QColor(220, 220, 220)
+        # The marks sit on the top edge, under the panes. A minor on a
+        # logarithmic axis is the short one, as it is on the pane.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(QPen(ink, 1.0))
+        if width > 0:
+            painter.drawLine(left, 0, left + width, 0)
+        for tick in self._ticks:
+            if tick.axis != 0:
+                continue
+            x = left + int(round(tick.x))
+            length = 3 if tick.logarithmic and not tick.labeled else _X_TICK
+            painter.drawLine(x, 0, x, length)
+        for x in _linear_minor_xs(self._ticks, width):
+            painter.drawLine(left + int(round(x)), 0, left + int(round(x)), 3)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(ink)
+        labels = self.x_tick_labels()
+        seen = 0
+        for tick in self._ticks:
+            if tick.axis != 0 or not tick.labeled:
+                continue
+            text = labels[seen]
+            seen += 1
+            x = left + int(round(tick.x))
+            painter.drawText(
+                QRect(x - 48, _X_TICK + 2, 96, _BOTTOM - 4),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                text,
+            )
+        if self._x_label and width > 0:
+            extent = metrics.height() + 4
+            shown = metrics.elidedText(self._x_label, Qt.TextElideMode.ElideRight, width)
+            painter.drawText(
+                QRect(left, _X_TICK + _BOTTOM, width, extent),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                shown,
+            )
 
     def set_x(self, x):
         self._plot.set_x(x)
@@ -487,7 +636,9 @@ class PlotWidget(QWidget):
         painter.fillRect(self.rect(), QColor(0, 0, 0))
         left, top, width, height = self._pane()
         area = QRect(left, top, width, height)
-        rule = QColor(40, 40, 40)
+        # 40 on black vanished beside the curve. One step lighter stays
+        # behind the line and can still be read as a rule.
+        rule = QColor(72, 72, 72)
         ink = QColor(220, 220, 220)
         painter.setPen(QPen(rule, 1.0))
         columns, _margin = self._y_layout()
@@ -542,7 +693,7 @@ class PlotWidget(QWidget):
                 self._plot.view_max_x() - self._plot.view_min_x(),
                 self._plot.view_max_y() - self._plot.view_min_y(),
             )
-            if tick.axis == 0:
+            if tick.axis == 0 and self._x_scale_visible:
                 x = left + int(round(tick.x))
                 painter.drawText(QRect(x - 48, top + height + 2, 96, _BOTTOM - 4),
                                  Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, text)
@@ -677,7 +828,7 @@ class PlotWidget(QWidget):
         # axis takes the curve's name, in the colour the curve is drawn.
         metrics = QFontMetrics(painter.font())
         extent = metrics.height() + 4
-        if self._x_label and width > 0:
+        if self._x_scale_visible and self._x_label and width > 0:
             shown = metrics.elidedText(self._x_label, Qt.TextElideMode.ElideRight, width)
             rect = QRect(left, top + height + _BOTTOM, width, extent)
             painter.setPen(ink)
@@ -951,10 +1102,7 @@ class PlotWidget(QWidget):
         stroke.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         stroke.setBrush(colour)
         stroke.setPen(Qt.PenStyle.NoPen)
-        on_pane = int(np.count_nonzero(
-            np.isfinite(pts[:, 0]) & (pts[:, 0] >= 0.0) & (pts[:, 0] <= width)
-        ))
-        radius = _marker_radius(on_pane, width) * ratio
+        radius = _marker_radius(self._plot.x_zoom()) * ratio
         for px, py in pts:
             if not math.isfinite(px) or not math.isfinite(py):
                 continue
